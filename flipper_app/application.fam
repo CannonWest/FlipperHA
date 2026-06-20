@@ -1,0 +1,14 @@
+App(
+    appid="flipperha",
+    name="FlipperHA",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="ha_remote_app",
+    stack_size=8 * 1024,
+    fap_category="Bluetooth",
+    fap_version="0.41",
+    fap_icon="flipperha.png",
+    fap_icon_assets="images",
+    fap_description="Home Assistant controller and thermostat remote for Flipper Zero",
+    fap_author="FlipperHA contributors",
+    fap_weburl="https://github.com/CannonWest/FlipperHA",
+)

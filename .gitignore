@@ -1,0 +1,33 @@
+# Local secrets and build overrides
+.env
+*.env
+flipper_app/src/ha_remote_local.h
+
+# Runtime state
+/data/
+bridge/data/
+*.jsonl
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ufbt / Flipper build outputs
+dist/
+build/
+.ufbt/
+.ufbt-state
+.ufbt-state/
+*.fap
+*.elf
+*.map
+*.bin
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

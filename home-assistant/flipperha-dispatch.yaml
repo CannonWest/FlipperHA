@@ -1,0 +1,52 @@
+alias: FlipperHA - Dispatch Example
+description: Dispatch example FlipperHA BTHome command args to your own Home Assistant actions.
+mode: queued
+max: 10
+triggers:
+  - trigger: state
+    entity_id: event.your_flipper_command_event
+conditions:
+  - condition: template
+    value_template: >-
+      {{
+        trigger.to_state is not none
+        and trigger.to_state.attributes.get('event_type') == 'step_up'
+      }}
+actions:
+  - variables:
+      flipper_action_id: >-
+        {{ (trigger.to_state.attributes.get('args', '') | string) | lower }}
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ flipper_action_id == '01' }}"
+        sequence:
+          - action: switch.toggle
+            target:
+              entity_id: switch.example_plug
+      - conditions:
+          - condition: template
+            value_template: "{{ flipper_action_id == '02' }}"
+        sequence:
+          - action: light.toggle
+            target:
+              entity_id: light.example_lamp
+      - conditions:
+          - condition: template
+            value_template: "{{ flipper_action_id == '03' }}"
+        sequence:
+          - action: scene.turn_on
+            target:
+              entity_id: scene.example_scene
+      - conditions:
+          - condition: template
+            value_template: "{{ flipper_action_id == '0a' }}"
+        sequence:
+          - action: script.turn_on
+            target:
+              entity_id: script.example_routine
+    default:
+      - action: system_log.write
+        data:
+          level: warning
+          message: "FlipperHA ignored unknown action id: {{ flipper_action_id }}"
