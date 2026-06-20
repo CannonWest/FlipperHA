@@ -3,6 +3,7 @@
 A native Flipper Zero app for controlling Home Assistant. It talks to a small local Python bridge, so your Home Assistant token stays on your computer and the Flipper only stores a bridge URL plus a shared key.
 
 <p>
+  <img src="docs/screenshots/main-menu.png" alt="Main Menu select screen" width="31%">
   <img src="docs/screenshots/controller-full.png" alt="Populated Controller screen with example labels" width="31%">
 </p>
 <p>
