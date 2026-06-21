@@ -67,6 +67,9 @@
 #define HA_REMOTE_ORDER_VERSION 1
 #define HA_REMOTE_ENTRY_MAGIC 0x324F5248UL
 #define HA_REMOTE_ENTRY_VERSION 2
+#define HA_REMOTE_SETTINGS_FILE APP_DATA_PATH("settings.bin")
+#define HA_REMOTE_SETTINGS_MAGIC 0x54455348UL
+#define HA_REMOTE_SETTINGS_VERSION 1
 #define HA_REMOTE_CUSTOM_ENTRY_MAX 12
 #define HA_REMOTE_CONTROLLER_ENTRY_MAX (HA_REMOTE_ACTION_COUNT + HA_REMOTE_CUSTOM_ENTRY_MAX)
 #define HA_REMOTE_ENTITY_ID_MAX 72
@@ -214,6 +217,14 @@ typedef struct {
     uint8_t order[HA_REMOTE_CONTROLLER_ENTRY_MAX];
     HaRemoteCustomEntry custom[HA_REMOTE_CUSTOM_ENTRY_MAX];
 } HaRemoteControllerEntryFile;
+
+typedef struct {
+    uint32_t magic;
+    uint8_t version;
+    uint8_t log_mode;
+    uint8_t vibration_enabled;
+    uint8_t reserved;
+} HaRemoteSettingsFile;
 
 typedef enum {
     HaRemoteLogModeLight,
@@ -503,6 +514,8 @@ typedef struct {
     bool controller_reorder_grabbed;
     bool controller_reorder_delete_focus;
     bool controller_reorder_delete_confirm;
+    bool rename_active;
+    uint8_t rename_custom_index;
     View* add_view;
     TextInput* add_text_input;
     FuriThread* add_load_thread;
@@ -556,6 +569,8 @@ static bool ha_remote_start_add_load(HaRemoteApp* app);
 static void ha_remote_join_add_load(HaRemoteApp* app);
 static void ha_remote_complete_add_load(HaRemoteApp* app);
 static void ha_remote_add_text_callback(void* context);
+static void ha_remote_rename_text_callback(void* context);
+static void ha_remote_open_rename(HaRemoteApp* app, uint8_t entry_id);
 static void ha_remote_root_callback(void* context, InputType input_type, uint32_t index);
 static void ha_remote_controller_callback(void* context, InputType input_type, uint32_t index);
 static void ha_remote_switch_to_view(HaRemoteApp* app, uint32_t view_id);
@@ -957,6 +972,54 @@ static bool ha_remote_controller_order_save(HaRemoteApp* app) {
     furi_record_close(RECORD_STORAGE);
 
     return ok;
+}
+
+static void ha_remote_settings_save(HaRemoteApp* app) {
+    HaRemoteSettingsFile data = {
+        .magic = HA_REMOTE_SETTINGS_MAGIC,
+        .version = HA_REMOTE_SETTINGS_VERSION,
+        .log_mode = (uint8_t)app->log_mode,
+        .vibration_enabled = app->vibration_enabled ? 1 : 0,
+        .reserved = 0,
+    };
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    FuriString* path = furi_string_alloc_set_str(HA_REMOTE_SETTINGS_FILE);
+    storage_common_resolve_path_and_ensure_app_directory(storage, path);
+
+    File* file = storage_file_alloc(storage);
+    if(storage_file_open(file, furi_string_get_cstr(path), FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+        storage_file_write(file, &data, sizeof(data));
+        storage_file_sync(file);
+    }
+
+    storage_file_close(file);
+    storage_file_free(file);
+    furi_string_free(path);
+    furi_record_close(RECORD_STORAGE);
+}
+
+static void ha_remote_settings_load(HaRemoteApp* app) {
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    FuriString* path = furi_string_alloc_set_str(HA_REMOTE_SETTINGS_FILE);
+    storage_common_resolve_path_and_ensure_app_directory(storage, path);
+
+    File* file = storage_file_alloc(storage);
+    if(storage_file_open(file, furi_string_get_cstr(path), FSAM_READ, FSOM_OPEN_EXISTING)) {
+        HaRemoteSettingsFile data;
+        if(storage_file_read(file, &data, sizeof(data)) == sizeof(data) &&
+           data.magic == HA_REMOTE_SETTINGS_MAGIC && data.version == HA_REMOTE_SETTINGS_VERSION) {
+            if(data.log_mode < HaRemoteLogModeCount) {
+                app->log_mode = (HaRemoteLogMode)data.log_mode;
+            }
+            app->vibration_enabled = data.vibration_enabled ? true : false;
+        }
+    }
+
+    storage_file_close(file);
+    storage_file_free(file);
+    furi_string_free(path);
+    furi_record_close(RECORD_STORAGE);
 }
 
 static void ha_remote_clear_pending_command(HaRemoteApp* app) {
@@ -3200,6 +3263,9 @@ static void ha_remote_controller_draw_callback(Canvas* canvas, void* model_conte
         false);
 
     if(model->reorder_delete_confirm) {
+        canvas_set_color(canvas, ColorWhite);
+        canvas_draw_box(canvas, 8, 18, 112, 36);
+        canvas_set_color(canvas, ColorBlack);
         canvas_draw_frame(canvas, 8, 18, 112, 36);
         canvas_draw_str(canvas, 14, 29, "Delete row?");
         ha_remote_draw_fit_str(canvas, 14, 42, 98, model->delete_label);
@@ -3962,6 +4028,56 @@ static void ha_remote_add_text_callback(void* context) {
     ha_remote_switch_to_view(app, HA_REMOTE_VIEW_ADD);
 }
 
+// Long-press OK on a custom row in Reorder mode opens this editable label box.
+static void ha_remote_open_rename(HaRemoteApp* app, uint8_t entry_id) {
+    if(ha_remote_entry_is_builtin(entry_id)) {
+        return;
+    }
+    uint8_t custom_index = entry_id - HA_REMOTE_ACTION_COUNT;
+    if(custom_index >= app->custom_entry_count) {
+        return;
+    }
+
+    app->rename_active = true;
+    app->rename_custom_index = custom_index;
+    snprintf(
+        app->add_text_buffer,
+        sizeof(app->add_text_buffer),
+        "%s",
+        app->custom_entries[custom_index].label);
+
+    text_input_reset(app->add_text_input);
+    text_input_set_header_text(app->add_text_input, "Rename Row");
+    text_input_set_minimum_length(app->add_text_input, 1);
+    text_input_set_result_callback(
+        app->add_text_input,
+        ha_remote_rename_text_callback,
+        app,
+        app->add_text_buffer,
+        sizeof(app->add_text_buffer),
+        false);
+    ha_remote_switch_to_view(app, HA_REMOTE_VIEW_ADD_TEXT);
+}
+
+static void ha_remote_rename_text_callback(void* context) {
+    HaRemoteApp* app = context;
+    furi_assert(app);
+
+    app->rename_active = false;
+    if(app->rename_custom_index < app->custom_entry_count) {
+        snprintf(
+            app->custom_entries[app->rename_custom_index].label,
+            sizeof(app->custom_entries[app->rename_custom_index].label),
+            "%s",
+            app->add_text_buffer);
+        ha_remote_controller_order_save(app);
+    }
+
+    ha_remote_switch_to_view(app, HA_REMOTE_VIEW_CONTROLLER);
+    ha_remote_set_header(app, "Renamed", true);
+    ha_remote_controller_model_sync(app, true);
+}
+
 static void ha_remote_add_open_confirm(HaRemoteApp* app) {
     HaRemoteCatalogItem* item = ha_remote_add_selected_item(app);
     if(!item) {
@@ -4361,6 +4477,17 @@ static bool ha_remote_controller_reorder_input(HaRemoteApp* app, InputEvent* eve
 
     if(event->type == InputTypeShort && event->key == InputKeyBack) {
         ha_remote_controller_exit_reorder(app);
+        return true;
+    }
+
+    if(event->type == InputTypeLong && event->key == InputKeyOk &&
+       !app->controller_reorder_grabbed && !app->controller_reorder_delete_focus &&
+       app->controller_selected >= HA_REMOTE_ACTION_MENU_BASE) {
+        uint8_t entry_id;
+        if(ha_remote_controller_entry_id_for_item(app, app->controller_selected, &entry_id) &&
+           !ha_remote_entry_is_builtin(entry_id)) {
+            ha_remote_open_rename(app, entry_id);
+        }
         return true;
     }
 
@@ -5099,6 +5226,7 @@ static void ha_remote_settings_callback(void* context, InputType input_type, uin
         ha_remote_update_settings_labels(app);
         ha_remote_set_header(
             app, app->vibration_enabled ? "Vibration On" : "Vibration Off", true);
+        ha_remote_settings_save(app);
     } else if(index == HA_REMOTE_SETTINGS_LOG_INDEX) {
         app->log_mode = (HaRemoteLogMode)((app->log_mode + 1) % HaRemoteLogModeCount);
         ha_remote_update_settings_labels(app);
@@ -5108,6 +5236,7 @@ static void ha_remote_settings_callback(void* context, InputType input_type, uin
             "Log: %s",
             ha_remote_log_mode_labels[app->log_mode]);
         ha_remote_set_header(app, app->status_header, true);
+        ha_remote_settings_save(app);
     } else if(index == HA_REMOTE_SETTINGS_BLE_HINT_INDEX) {
         ha_remote_set_header(app, "Long OK uses BLE", true);
     }
@@ -5194,6 +5323,12 @@ static bool ha_remote_navigation_callback(void* context) {
     }
 
     if(app->current_view == HA_REMOTE_VIEW_ADD_TEXT) {
+        if(app->rename_active) {
+            app->rename_active = false;
+            ha_remote_switch_to_view(app, HA_REMOTE_VIEW_CONTROLLER);
+            ha_remote_controller_model_sync(app, true);
+            return true;
+        }
         app->add_mode = HaRemoteAddModeConfirm;
         ha_remote_switch_to_view(app, HA_REMOTE_VIEW_ADD);
         ha_remote_add_model_sync(app, true);
@@ -5348,6 +5483,7 @@ static HaRemoteApp* ha_remote_alloc(void) {
     ha_remote_init_thermostat_state(app);
     ha_remote_bridge_config_load(app);
     ha_remote_thermostat_config_load(app);
+    ha_remote_settings_load(app);
     ha_remote_controller_order_load(app);
 
     if(!ha_remote_init_beacon_payload(app)) {
