@@ -2,6 +2,16 @@
 
 This repo keeps generated Flipper artifacts out of git. Build locally, then attach the `.fap` file to a GitHub Release or another release channel.
 
+## Cutting a Release (every version)
+
+Releasing the FAP is part of the dev loop — **every** `fap_version` bump gets a matching GitHub Release with a freshly built FAP. After bumping `fap_version` in `application.fam`, committing, and pushing to `main`:
+
+```powershell
+py tools/release.py
+```
+
+It builds the FAP from a `git archive` of `HEAD` (not the working tree), so the public download can never pick up a local `flipper_app/src/ha_remote_local.h` and bake in a private bridge URL/key. It tags `v<fap_version>`, attaches the FAP, and auto-generates notes from the commits. Use `--notes-file NOTES.md` for hand-written notes or `--draft` to stage one for review. (Run it with a Python that has `ufbt` — plain `py` works; a Store-aliased Python does not.)
+
 ## Local Build
 
 From the repo root:
