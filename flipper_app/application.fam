@@ -5,7 +5,7 @@ App(
     entry_point="ha_remote_app",
     stack_size=8 * 1024,
     fap_category="Tools",
-    fap_version="0.42",
+    fap_version="0.43",
     fap_icon="flipperha.png",
     fap_icon_assets="images",
     fap_description="Home Assistant controller and thermostat remote for Flipper Zero",

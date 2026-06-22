@@ -305,6 +305,23 @@ def fetch_entity_display_state(ha_url: str, token: str, entity_id: str, timeout:
     return display_state_from_state(fetch_ha_state(ha_url, token, entity_id, timeout))
 
 
+def fetch_batch_display_states(
+    ha_url: str, token: str, entity_ids: list[str], timeout: float
+) -> str:
+    """One /api/states call -> "|entity_id=state" for each requested id (in order)."""
+    by_id = {
+        str(state.get("entity_id")): state
+        for state in fetch_all_states(ha_url, token, timeout)
+    }
+    parts = []
+    for entity_id in entity_ids:
+        state = by_id.get(entity_id)
+        value = display_state_from_state(state) if state is not None else "--"
+        value = value.replace("|", " ").replace("=", " ").strip() or "--"
+        parts.append(f"|{entity_id}={value}")
+    return "".join(parts)
+
+
 def call_entity_toggle(ha_url: str, token: str, entity_id: str, timeout: float) -> None:
     domain = entity_id.split(".", 1)[0]
     if domain not in {"switch", "light"}:
@@ -720,6 +737,21 @@ def make_handler(
                     offset = 0
                 try:
                     text = fetch_catalog_page(ha_url, token, timeout, category, offset)
+                except urllib.error.HTTPError as exc:
+                    self.send_text(502, f"ha http {exc.code}")
+                    return
+                except Exception as exc:
+                    self.send_text(502, f"ha error {type(exc).__name__}")
+                    return
+
+                self.send_text(200, text or "empty")
+                return
+
+            if parsed.path.startswith("/v1/entity/states/"):
+                raw = urllib.parse.unquote(parsed.path[len("/v1/entity/states/"):])
+                requested = [item for item in raw.split(",") if item]
+                try:
+                    text = fetch_batch_display_states(ha_url, token, requested, timeout)
                 except urllib.error.HTTPError as exc:
                     self.send_text(502, f"ha http {exc.code}")
                     return

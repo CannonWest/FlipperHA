@@ -37,6 +37,14 @@
 #define HA_REMOTE_STATUS_TIMER_MS 3000
 #define HA_REMOTE_COMMAND_CANCEL_WINDOW_MS 750
 #define HA_REMOTE_LOADING_STEP_MS 250
+// Marquee (chyron) for the long entity_id on the Add -> Info screen.
+#define HA_REMOTE_MARQUEE_TICK_MS 220
+#define HA_REMOTE_MARQUEE_HOLD_TICKS 7
+#define HA_REMOTE_MARQUEE_VISIBLE_CHARS 20
+#define HA_REMOTE_MARQUEE_HOLD_START 0
+#define HA_REMOTE_MARQUEE_SCROLL 1
+#define HA_REMOTE_MARQUEE_HOLD_END 2
+#define HA_REMOTE_MARQUEE_SCROLL_BACK 3
 #define HA_REMOTE_COMMAND_QUEUE_CAPACITY 15
 #define HA_REMOTE_COMMAND_RESULT_QUEUE_CAPACITY (HA_REMOTE_COMMAND_QUEUE_CAPACITY + 1)
 #define HA_REMOTE_COMMAND_WORKER_STACK_SIZE 6144
@@ -102,7 +110,7 @@
 #define HA_REMOTE_THERMOSTAT_CONFIG_FILE APP_DATA_PATH("thermostat.cfg")
 #define HA_REMOTE_BRIDGE_URL_MAX 160
 #define HA_REMOTE_BRIDGE_KEY_MAX 96
-#define HA_REMOTE_COMMAND_PATH_MAX 176
+#define HA_REMOTE_COMMAND_PATH_MAX 416
 
 #if __has_include("ha_remote_local.h")
 #include "ha_remote_local.h"
@@ -131,7 +139,10 @@
 #define HA_REMOTE_UART_PING_RETRY_DELAY_MS 250
 #define HA_REMOTE_HTTP_RESPONSE_MAX 1024
 #define HA_REMOTE_HTTP_BODY_MAX 768
-#define HA_REMOTE_HTTP_COMMAND_MAX 384
+#define HA_REMOTE_HTTP_COMMAND_MAX 544
+// Cap the batched-state request path so the full [GET] command stays under the
+// FlipperHTTP UART command ceiling (~512B). Rows beyond this fall back to unknown.
+#define HA_REMOTE_SYNC_PATH_BUDGET 380
 #define HA_REMOTE_LABEL_MAX 40
 #define HA_REMOTE_STATE_MAX 12
 #define HA_REMOTE_THERMO_VALUE_MAX 20
@@ -392,6 +403,7 @@ typedef struct {
     uint8_t total_count;
     uint8_t offset;
     uint8_t confirm_focus;
+    uint16_t marquee_offset;
     bool loading;
 } HaRemoteAddModel;
 
@@ -402,6 +414,7 @@ typedef enum {
     HaRemoteCustomEventCommandComplete,
     HaRemoteCustomEventCommandStatusChanged,
     HaRemoteCustomEventAddLoadComplete,
+    HaRemoteCustomEventMarqueeTick,
 } HaRemoteCustomEvent;
 
 typedef enum {
@@ -445,6 +458,11 @@ typedef struct {
     FuriTimer* beacon_timer;
     FuriTimer* status_timer;
     FuriTimer* command_timer;
+    FuriTimer* marquee_timer;
+    uint16_t marquee_offset;
+    uint16_t marquee_max_offset;
+    uint16_t marquee_tick;
+    uint8_t marquee_phase;
     uint8_t packet_id;
 
     uint8_t beacon_payload[EXTRA_BEACON_MAX_DATA_SIZE];
@@ -602,6 +620,63 @@ static void ha_remote_command_timer_callback(void* context) {
     furi_assert(app);
 
     view_dispatcher_send_custom_event(app->view_dispatcher, HaRemoteCustomEventDispatchPendingCommand);
+}
+
+static void ha_remote_marquee_start(HaRemoteApp* app, const char* text) {
+    app->marquee_offset = 0;
+    app->marquee_phase = HA_REMOTE_MARQUEE_HOLD_START;
+    app->marquee_tick = 0;
+    size_t len = text ? strlen(text) : 0;
+    app->marquee_max_offset = len > HA_REMOTE_MARQUEE_VISIBLE_CHARS ?
+                                  (uint16_t)(len - HA_REMOTE_MARQUEE_VISIBLE_CHARS) :
+                                  0;
+    if(app->marquee_timer) {
+        if(app->marquee_max_offset > 0) {
+            furi_timer_start(app->marquee_timer, HA_REMOTE_MARQUEE_TICK_MS);
+        } else {
+            furi_timer_stop(app->marquee_timer);
+        }
+    }
+}
+
+static void ha_remote_marquee_timer_callback(void* context) {
+    HaRemoteApp* app = context;
+    furi_assert(app);
+
+    // Self-stop once we leave the Info screen (so every exit path is covered).
+    if(app->current_view != HA_REMOTE_VIEW_ADD || app->add_mode != HaRemoteAddModeInfo ||
+       app->marquee_max_offset == 0) {
+        furi_timer_stop(app->marquee_timer);
+        return;
+    }
+
+    if(app->marquee_phase == HA_REMOTE_MARQUEE_SCROLL) {
+        if(app->marquee_offset < app->marquee_max_offset) {
+            app->marquee_offset++;
+        } else {
+            app->marquee_phase = HA_REMOTE_MARQUEE_HOLD_END;
+            app->marquee_tick = 0;
+        }
+    } else if(app->marquee_phase == HA_REMOTE_MARQUEE_HOLD_END) {
+        if(++app->marquee_tick >= HA_REMOTE_MARQUEE_HOLD_TICKS) {
+            app->marquee_phase = HA_REMOTE_MARQUEE_SCROLL_BACK;
+            app->marquee_tick = 0;
+        }
+    } else if(app->marquee_phase == HA_REMOTE_MARQUEE_SCROLL_BACK) {
+        if(app->marquee_offset > 0) {
+            app->marquee_offset--;
+        } else {
+            app->marquee_phase = HA_REMOTE_MARQUEE_HOLD_START;
+            app->marquee_tick = 0;
+        }
+    } else {
+        if(++app->marquee_tick >= HA_REMOTE_MARQUEE_HOLD_TICKS) {
+            app->marquee_phase = HA_REMOTE_MARQUEE_SCROLL;
+            app->marquee_tick = 0;
+        }
+    }
+
+    view_dispatcher_send_custom_event(app->view_dispatcher, HaRemoteCustomEventMarqueeTick);
 }
 
 static Submenu* ha_remote_current_menu(HaRemoteApp* app) {
@@ -1200,6 +1275,13 @@ static bool ha_remote_custom_event_callback(void* context, uint32_t event) {
         return true;
     }
 
+    if(event == HaRemoteCustomEventMarqueeTick) {
+        if(app->current_view == HA_REMOTE_VIEW_ADD && app->add_mode == HaRemoteAddModeInfo) {
+            ha_remote_add_model_sync(app, true);
+        }
+        return true;
+    }
+
     return false;
 }
 
@@ -1277,7 +1359,8 @@ static void ha_remote_schedule_action_command(HaRemoteApp* app, uint8_t entry_id
     app->pending_action_index = entry_id;
     app->pending_command_path[0] = '\0';
     ha_remote_set_header(app, ha_remote_current_default_header(app), false);
-    furi_timer_start(app->command_timer, HA_REMOTE_COMMAND_CANCEL_WINDOW_MS);
+    view_dispatcher_send_custom_event(
+        app->view_dispatcher, HaRemoteCustomEventDispatchPendingCommand);
 }
 
 static void ha_remote_schedule_dimmer_command(
@@ -1323,7 +1406,8 @@ static void ha_remote_schedule_thermostat_command(HaRemoteApp* app, const char* 
     app->pending_action_index = 0;
     snprintf(app->pending_command_path, sizeof(app->pending_command_path), "%s", path);
     ha_remote_set_header(app, ha_remote_current_default_header(app), false);
-    furi_timer_start(app->command_timer, HA_REMOTE_COMMAND_CANCEL_WINDOW_MS);
+    view_dispatcher_send_custom_event(
+        app->view_dispatcher, HaRemoteCustomEventDispatchPendingCommand);
 }
 
 static bool ha_remote_init_beacon_payload(HaRemoteApp* app) {
@@ -2109,6 +2193,28 @@ static int32_t ha_remote_command_worker(void* context) {
     return 0;
 }
 
+// Pull one row's state out of a batched "|id=state|id=state" response.
+static bool ha_remote_batch_state(
+    const char* body,
+    const char* entity_id,
+    char* out,
+    size_t out_size) {
+    char needle[HA_REMOTE_ENTITY_ID_MAX + 3];
+    snprintf(needle, sizeof(needle), "|%s=", entity_id);
+    const char* found = strstr(body, needle);
+    if(!found) {
+        return false;
+    }
+    found += strlen(needle);
+    size_t i = 0;
+    while(found[i] && found[i] != '|' && i + 1 < out_size) {
+        out[i] = found[i];
+        i++;
+    }
+    out[i] = '\0';
+    return true;
+}
+
 static int32_t ha_remote_controller_sync_worker(void* context) {
     HaRemoteApp* app = context;
     char command[HA_REMOTE_HTTP_COMMAND_MAX];
@@ -2116,16 +2222,44 @@ static int32_t ha_remote_controller_sync_worker(void* context) {
     char body[HA_REMOTE_HTTP_BODY_MAX];
     char path[HA_REMOTE_COMMAND_PATH_MAX];
 
-    bool ok = ha_remote_bridge_get_with_buffers(
-        app,
-        "/states",
-        command,
-        sizeof(command),
-        response,
-        sizeof(response),
-        body,
-        sizeof(body),
-        false);
+    // Build ONE request for every switch/light row (routines need no state fetch).
+    int written = snprintf(path, sizeof(path), "/v1/entity/states/");
+    size_t path_len = written > 0 ? (size_t)written : 0;
+    bool any_fetch = false;
+    for(uint8_t i = 0; i < app->custom_entry_count; i++) {
+        if(!app->custom_entries[i].used ||
+           app->custom_entries[i].kind == HaRemoteCustomKindRoutine) {
+            continue;
+        }
+        const char* eid = app->custom_entries[i].entity_id;
+        size_t need = strlen(eid) + (any_fetch ? 1u : 0u);
+        if(path_len + need >= HA_REMOTE_SYNC_PATH_BUDGET) {
+            break;
+        }
+        if(any_fetch) {
+            path[path_len++] = ',';
+        }
+        int w = snprintf(path + path_len, sizeof(path) - path_len, "%s", eid);
+        if(w > 0) {
+            path_len += (size_t)w;
+        }
+        any_fetch = true;
+    }
+
+    bool ok = true;
+    body[0] = '\0';
+    if(any_fetch) {
+        ok = ha_remote_bridge_get_with_buffers(
+            app,
+            path,
+            command,
+            sizeof(command),
+            response,
+            sizeof(response),
+            body,
+            sizeof(body),
+            false);
+    }
 
     snprintf(app->controller_sync_body, sizeof(app->controller_sync_body), "%s", body);
 
@@ -2140,23 +2274,11 @@ static int32_t ha_remote_controller_sync_worker(void* context) {
             continue;
         }
 
-        snprintf(path, sizeof(path), "/v1/entity/state/%s", app->custom_entries[i].entity_id);
-        bool state_ok = ha_remote_bridge_get_with_buffers(
-            app,
-            path,
-            command,
-            sizeof(command),
-            response,
-            sizeof(response),
-            body,
-            sizeof(body),
-            false);
-        if(state_ok) {
-            ha_remote_copy_trimmed(
-                app->custom_states[i],
-                sizeof(app->custom_states[i]),
-                body[0] ? body : "--",
-                strlen(body[0] ? body : "--"));
+        if(ok && ha_remote_batch_state(
+                     body,
+                     app->custom_entries[i].entity_id,
+                     app->custom_states[i],
+                     sizeof(app->custom_states[i]))) {
             app->custom_state_known[i] = true;
         } else {
             app->custom_state_known[i] = false;
@@ -2835,6 +2957,31 @@ static void ha_remote_draw_fit_str(
         }
     }
 
+    canvas_draw_str(canvas, x, y, fit);
+}
+
+// Draw a horizontal window of `text` starting at `offset` chars, clipped to
+// `width` (no ellipsis). Sliding `offset` scrolls the text like a chyron.
+static void ha_remote_draw_marquee_str(
+    Canvas* canvas,
+    int32_t x,
+    int32_t y,
+    size_t width,
+    const char* text,
+    uint16_t offset) {
+    if(!text) {
+        return;
+    }
+    size_t len = strlen(text);
+    if(offset > len) {
+        offset = (uint16_t)len;
+    }
+    char fit[HA_REMOTE_ENTITY_ID_MAX + 1];
+    snprintf(fit, sizeof(fit), "%s", text + offset);
+    size_t flen = strlen(fit);
+    while(flen > 0 && canvas_string_width(canvas, fit) > width) {
+        fit[--flen] = '\0';
+    }
     canvas_draw_str(canvas, x, y, fit);
 }
 
@@ -3588,6 +3735,7 @@ static void ha_remote_add_model_sync(HaRemoteApp* app, bool update) {
     model->total_count = app->add_total_count;
     model->offset = app->add_offset;
     model->confirm_focus = app->add_confirm_focus;
+    model->marquee_offset = app->marquee_offset;
     model->loading = app->add_loading;
     view_commit_model(app->add_view, update);
 }
@@ -3947,7 +4095,7 @@ static void ha_remote_add_draw_info(Canvas* canvas, HaRemoteAddModel* model) {
     ha_remote_draw_fit_str(canvas, 39, 35, 80, item->type_label);
     canvas_draw_str(canvas, 10, 46, "Mode");
     ha_remote_draw_fit_str(canvas, 39, 46, 80, ha_remote_add_capability_label(item->capability));
-    ha_remote_draw_fit_str(canvas, 10, 57, 108, item->entity_id);
+    ha_remote_draw_marquee_str(canvas, 10, 57, 108, item->entity_id, model->marquee_offset);
 }
 
 static void ha_remote_add_draw_confirm_button(
@@ -4301,6 +4449,8 @@ static bool ha_remote_add_input_callback(InputEvent* event, void* context) {
     if(event->type == InputTypeShort && event->key == InputKeyOk) {
         if(app->add_button == HaRemoteAddButtonInfo) {
             app->add_mode = HaRemoteAddModeInfo;
+            HaRemoteCatalogItem* info_item = ha_remote_add_selected_item(app);
+            ha_remote_marquee_start(app, info_item ? info_item->entity_id : "");
             ha_remote_add_model_sync(app, true);
         } else if(app->add_origin == HaRemoteAddOriginThermostat) {
             HaRemoteCatalogItem* item = ha_remote_add_selected_item(app);
@@ -5398,6 +5548,11 @@ static void ha_remote_free_partial(HaRemoteApp* app) {
         furi_timer_free(app->command_timer);
     }
 
+    if(app->marquee_timer) {
+        furi_timer_stop(app->marquee_timer);
+        furi_timer_free(app->marquee_timer);
+    }
+
     if(app->command_queue) {
         furi_message_queue_free(app->command_queue);
     }
@@ -5509,8 +5664,10 @@ static HaRemoteApp* ha_remote_alloc(void) {
 
     app->command_timer =
         furi_timer_alloc(ha_remote_command_timer_callback, FuriTimerTypeOnce, app);
-    if(!app->command_timer) {
-        FURI_LOG_E(HA_REMOTE_LOG_TAG, "Failed to allocate command timer");
+    app->marquee_timer =
+        furi_timer_alloc(ha_remote_marquee_timer_callback, FuriTimerTypePeriodic, app);
+    if(!app->command_timer || !app->marquee_timer) {
+        FURI_LOG_E(HA_REMOTE_LOG_TAG, "Failed to allocate timers");
         ha_remote_free_partial(app);
         return NULL;
     }
@@ -5644,7 +5801,7 @@ static HaRemoteApp* ha_remote_alloc(void) {
     submenu_set_header(app->about_menu, "About");
     submenu_add_item_ex(
         app->about_menu,
-        "FlipperHA v0.41",
+        "FlipperHA v0.43",
         HA_REMOTE_ABOUT_VERSION_INDEX,
         ha_remote_about_callback,
         app);
